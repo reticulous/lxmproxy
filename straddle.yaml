@@ -1,0 +1,138 @@
+# lxmproxy — the always-on server half of the LXMF proxy.
+#
+# One device holds an LXMF account's keys, registers and announces its
+# `lxmf.delivery`, receives its mail and sends its outbound; another device —
+# the owner's, roaming — holds the same keys, registers nothing, and exchanges
+# messages with this one over a permanently-held RNS Channel. The rest of the
+# network sees an ordinary always-online LXMF node and needs to implement
+# nothing.
+#
+# The CLIENT half is in the lxmf straddle: it touches the role setting, the
+# delivery-queue handoff, message statuses and checkmarks, the link indicator,
+# and writing inbound into the message tree, all of which lxmf already owns. The
+# shared frame codec is lxmf's `lxmproxy_wire.h`. This straddle is only the
+# server, so a small roaming board gets the client for free and never pays for
+# it.
+#
+# The cost is stated plainly and not designed around: both devices hold the
+# account key and the cleartext.
+schema_version: 1
+name: reticulous/lxmproxy
+prefix: lxmproxy
+version: 0.0.0
+firmware: esp-idf
+platforms: [idf]
+requires:
+  - reticulous/rns
+  # A hosted account is an ORDINARY lxmf identity — lxmf's store, delivery
+  # queue, retry and status transitions do all the work, and this straddle
+  # watches storage and translates. It also supplies the shared wire codec.
+  - reticulous/lxmf
+# Auto-init: folded into the generated service registry. LxmproxyService::onInit
+# registers the `lxmproxy` CLI verb and the approval sentinels, then hands the
+# server task to the RNS orchestrator, which starts it once rnsd is up. The task
+# stays idle until s.lxmproxy.enabled flips on.
+services:
+  - { class: LxmproxyService, header: lxmproxy.h }
+
+# Declarative settings: both surfaces + storage defaults from one source.
+settings:
+  - at:
+      - { id: reticulum }
+      - { id: lxmproxy, label: "LXMF proxy server", short: "Proxy" }
+    rows:
+      - title: "LXMF proxy server"
+      - caption: "Hold other devices' LXMF accounts so their mail arrives while they are switched off. Each account you host is announced from this device, under its own address."
+      - switch: { label: "Serve accounts", key: s.lxmproxy.enabled, default: 0 }
+      - text:
+          label: "Label"
+          key: s.lxmproxy.label
+          placeholder_key: lxmproxy.label
+      - caption: "What clients see when they pick this server from the ones they have heard. Nobody types an address."
+      - info:
+          rows:
+            - value: { label: "Address", key: lxmproxy.dest, copyable: true }
+            - value: { label: "Accounts", key: lxmproxy.accounts }
+      # A device asking to be hosted is waiting on a person. The row appears on
+      # its own when there is something to answer, so nobody has to know to press
+      # a button to find out — the list below is where it is answered.
+      - value: { label: "Waiting", key: lxmproxy.pending_text }
+        when_key: lxmproxy.pending_text
+
+      - section: "What each account may use"
+      - integer:
+          label: "Store per account"
+          key: s.lxmproxy.quota_kb
+          min: 8
+          max: 1024
+          step: 8
+          buttons: true
+          unit: "kB"
+      - caption: "Counted over everything still held for the account — mail not yet handed to the owner's device, and outbound not yet settled. A connected client drains both. At the limit this server stops accepting that account's inbound without acknowledging it, so the sender's own retry keeps the message."
+      - integer:
+          label: "Largest message"
+          key: s.lxmproxy.max_envelope_kb
+          min: 1
+          max: 256
+          buttons: true
+          unit: "kB"
+      - integer:
+          label: "Keep unretrieved mail for"
+          key: s.lxmproxy.retain_days
+          min: 1
+          max: 90
+          buttons: true
+          unit: "days"
+      - caption: "A message can be delivered to this server and still expire before its owner ever sees it. Longer is kinder; the store is small."
+      - advanced:
+          label: "Advanced"
+          rows:
+            - switch: { label: "Keep messages after handover", key: s.lxmproxy.keep_handed, default: 0 }
+            - caption: "Off, a message is deleted once the owner's device confirms it has stored it. On, this device keeps a copy — only sensible where the store is large."
+            - integer:
+                label: "Push bodies up to"
+                key: s.lxmproxy.inline_bytes
+                min: 0
+                max: 65536
+                unit: "bytes"
+            - caption: "0 derives it from the measured round trip to each client. A larger body is offered as a download instead of being pushed."
+
+      # The accounts this box has agreed to host. The list is operator policy —
+      # holding the account key is the entitlement, and this says which
+      # key-holders were approved. lxmproxy.cpp owns every mutation through the
+      # lxmproxy.acct.* sentinels and validates there, so a malformed hash comes
+      # back as a sentence rather than as a rule written twice.
+      - list:
+          label: "Accounts served"
+          caption: "Each one is announced from this device under its own address. Removing an account takes that address off the air here — its owner's device registers it again."
+          key: s.lxmproxy.serves
+          id: id
+          item: "{label}"
+          subtitle: "{id}"
+          status: "lxmproxy.acct.{id}"
+          empty: "No accounts yet. A device that links here appears under Waiting for approval."
+          cmd: lxmproxy.acct
+          candidates:
+            key: lxmproxy.pending
+            item: "{name}"
+            subtitle: "{id}"
+            found: "Waiting for approval"
+            # The refresh key sits BESIDE the array, not under it: a write under
+            # `lxmproxy.pending.` would appear as a member of the array itself.
+            # Nothing acts on it — the pending list is published continuously
+            # from the live sessions, so opening the popup only has to show what
+            # is already there.
+            refresh:
+              label: "Waiting for approval"
+              do: { set: { key: lxmproxy.pending_refresh, value: "1", edge: true } }
+          add:
+            - label: "Approve account"
+              form:
+                title: "Approve account"
+                submit: "Approve"
+                fields:
+                  - text: { label: "Account identity", field: id, placeholder: "32 hex characters" }
+                  - text: { label: "Whose", field: label, placeholder: "optional" }
+          remove: { confirm: "Stop serving {label}? Its address goes off the air here." }
+          edit:
+            - text: { label: "Whose", field: label }
