@@ -65,6 +65,18 @@ static const char* TAG = "lxmproxy";
 /* How often an idle session re-scans lxmf's store for work. Storage changes
  * mark the session dirty and it scans at once; this is the backstop. */
 #define LXMPROXY_SCAN_PERIOD_S  10
+/* How long a pushed MSG is left to be acknowledged before a scan offers it
+ * again. `handed` is the only thing that retires an inbound record, and it
+ * cannot arrive until the client has stored the body — seconds away on a radio,
+ * and never at all while the client is off the air. Without this a scan re-sent
+ * every unacknowledged message it could still see, so one arrival became a
+ * push per scan for as long as the ack took. The Channel is already reliable
+ * (it sequences and resends what goes unproved), so this is the backstop for a
+ * frame the Channel itself gave up on, not the delivery mechanism — which is
+ * why it is far longer than the scan period. A reconnect clears the ledger and
+ * re-offers everything at once, which is what makes the remainder resumable
+ * with no cursor. */
+#define LXMPROXY_REPUSH_S       120
 /* The retention sweep is cheap and its unit is days — an hour is plenty. */
 #define LXMPROXY_SWEEP_PERIOD_S 3600
 /* Resource opaque ids for our outbound frames. */
@@ -108,6 +120,13 @@ struct session_t {
      * emits STATUS only on a change. Bounded by the outbound this box still
      * holds, which SETTLED is what clears. */
     std::map<std::string, uint8_t> sent_status;
+    /* When each inbound message was last pushed ("<peer>/<key>" → monotonic
+     * seconds), so a scan offers one again only after LXMPROXY_REPUSH_S rather
+     * than every time it walks a record the client has not acknowledged yet.
+     * This is the inbound half of what sent_status does for outbound; `handed`
+     * is an acknowledgement, not a record of having sent. Rebuilt from each
+     * scan's own rows, so it holds only what this box is still carrying. */
+    std::map<std::string, uint32_t> sent_msg_s;
     /* The last STATE relayed, so an idle scan puts nothing on the air. A
      * Channel message costs real airtime on a radio link, and "nothing has
      * changed" is not worth one. */
@@ -380,7 +399,13 @@ static void pushScan(session_t& s)
 
     uint32_t owed = 0;
     uint32_t inline_max = inlineThreshold(s);
+    uint32_t now_s = nowS();
     int pushed = 0;
+    /* The push ledger, rebuilt from the rows this scan actually walked and
+     * swapped in at the end. Carrying entries over one at a time would leave
+     * behind whatever the scan no longer finds — handed over, expired, deleted
+     * — so it is rebuilt rather than pruned. */
+    std::map<std::string, uint32_t> still_held;
 
     for (const RecordRow& r : rows) {
         uint8_t mid[LXMPROXY_MID_LEN], peer[16];
@@ -391,6 +416,15 @@ static void pushScan(session_t& s)
             owed += (uint32_t)r.body_size;
             /* Inbound records are keyed by the real message_id. */
             if (!fromHex(r.key, mid, LXMPROXY_MID_LEN)) continue;
+            std::string mk = r.peer + "/" + r.key;
+            /* Offered recently enough that the client has not had time to
+             * answer: the Channel is still carrying that frame, and sending it
+             * again would only spend airtime racing its own resend. */
+            auto sent = s.sent_msg_s.find(mk);
+            if (sent != s.sent_msg_s.end() && now_s - sent->second < LXMPROXY_REPUSH_S) {
+                still_held[mk] = sent->second;
+                continue;
+            }
             std::string content =
                 storageGetStr(msgKey(s.slot, r.peer, r.key, "content").c_str(), "");
             bool inlineBody = content.size() <= inline_max;
@@ -399,8 +433,10 @@ static void pushScan(session_t& s)
                                r.peer + ".display_name").c_str(), "");
             if (sendFrame(s, lxmproxyBuildMsg(mid, peer, name.c_str(), (uint32_t)r.ts,
                                               r.title, (uint32_t)content.size(),
-                                              inlineBody ? &content : nullptr)))
+                                              inlineBody ? &content : nullptr))) {
+                still_held[mk] = now_s;
                 pushed++;
+            }
             continue;
         }
         if (r.dir != "out") continue;
@@ -432,6 +468,8 @@ static void pushScan(session_t& s)
                                              have_mid ? midbuf : nullptr)))
             s.sent_status[mk] = st;
     }
+
+    s.sent_msg_s.swap(still_held);
 
     applyQuota(s, owed);
     s.owed_bytes = owed;
@@ -717,6 +755,7 @@ static void handleRelease(session_t& s)
     s.awaiting_release = true;
     s.id_deadline_s    = nowS() + LXMPROXY_IDENTITY_WAIT_S;
     s.sent_status.clear();
+    s.sent_msg_s.clear();
     lxmfDestroyIdentity(s.releasing_slot, /*sync=*/false);
 }
 
@@ -1299,6 +1338,7 @@ static void lxmproxyTask(void*)
                 s.awaiting_release = true;
                 s.id_deadline_s    = now_s + LXMPROXY_IDENTITY_WAIT_S;
                 s.sent_status.clear();
+                s.sent_msg_s.clear();
                 lxmfDestroyIdentity(s.releasing_slot, /*sync=*/false);
             }
             /* Just approved, and the client is sitting on the Channel waiting

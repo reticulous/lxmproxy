@@ -173,8 +173,20 @@ this task for up to five seconds with every other session's mail behind it.
 callback carries no ctx pointer, so the accumulator is file-scope, as lxmf's own
 scans are) and does three things:
 
-- **inbound with `handed == 0`** → `MSG`, with the body inline when it is within
-  the inline threshold and `nil` when it is not. Its bytes count toward `owed`.
+- **inbound with `handed == 0`, and not pushed in the last
+  `LXMPROXY_REPUSH_S`** → `MSG`, with the body inline when it is within the
+  inline threshold and `nil` when it is not. Its bytes count toward `owed`.
+  `sent_msg_s` remembers when each was last offered, keyed `"<peer>/<key>"` —
+  the inbound half of what `sent_status` does for outbound, and necessary for
+  the same reason. `handed` is an acknowledgement, not a record of having sent:
+  it cannot arrive until the client has stored the body, which is seconds away
+  on a radio and never at all while the client is off the air. Scanning on that
+  alone re-sent every unacknowledged message on every pass, so one arrival cost
+  a push per scan — thirteen frames in half a second for a single message, into
+  a Channel window five deep. The Channel already sequences and resends what
+  goes unproved, so the interval is a backstop for a frame it gave up on rather
+  than the delivery mechanism, which is why it is far longer than the scan
+  period. The ledger is pruned to the rows each scan actually saw.
 - **outbound whose status has moved, and which the client has not acknowledged**
   → `STATUS`, carrying `message_id` so the client can map its local key onto
   this box's record. `sent_status` remembers what was last relayed, keyed
@@ -193,7 +205,9 @@ scans are) and does three things:
 **What is left is what is owed.** There is no cursor and no resume position,
 because there is nothing to resume: a reconnect re-pushes the remainder and the
 client dedups on `message_id`. A client record held with the body still absent
-is a pending fetch, not a duplicate.
+is a pending fetch, not a duplicate. A new Channel is a fresh `session_t`, so
+`sent_msg_s` starts empty and that re-push is immediate — the ledger paces a
+live session, and never delays a reconnect.
 
 **`handed` is set by `HANDED`, and by nothing else.** rnsd proves a packet the
 moment the hand-off to the consumer task succeeds, before anything is parsed or
