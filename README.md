@@ -161,7 +161,7 @@ lxmproxy.accounts              how many accounts are approved
 lxmproxy.acct.<id>             per-account status pill, packed "text|color"
 lxmproxy.pending.<i>.{id,name,dest}   identified clients awaiting approval
 lxmproxy.pending_text          "N devices waiting for approval", empty when none
-lxmproxy.acct.{add,set,remove} the settings collection's sentinels
+lxmproxy.acct.{add,set,remove} the settings collection's command keys
 lxmproxy.acct.{error,done}     their answer pair
 ```
 

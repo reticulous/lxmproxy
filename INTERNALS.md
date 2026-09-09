@@ -1,7 +1,7 @@
 # lxmproxy — internals
 
 ```
-LxmproxyService::onInit()          [boot task]  defaults, the acct.* sentinels,
+LxmproxyService::onInit()          [boot task]  defaults, the acct.* command keys,
  ↓                                              mint the identity, publish the
  ↓                                              address, register the CLI verb
 rnsServiceRegister → lxmproxyStart [rnsd up]    spawn / un-park the server task
@@ -288,7 +288,7 @@ gone — not on a timer.
 `s.lxmproxy.serves` is an array of per-field objects `{ id, label }`, `id` being
 the account's identity hash and also the list's item id. This file is its only
 writer: both UIs mutate it through the `lxmproxy.acct.{add,set,remove}`
-sentinels, which land in `acctSentinel` on the storage task, validate there, and
+command keys, which land in `acctSentinel` on the storage task, validate there, and
 answer on the shared `lxmproxy.acct.{error,done}` pair. So the 32-hex rule is
 stated once, in firmware, and a rejection is a sentence the form shows rather
 than a regex written twice.
@@ -329,7 +329,7 @@ re-sends.
 ## 10. Pitfalls
 
 - **Only lxmf may write an account's records.** Everything here goes through
-  lxmf's own sentinels (`cmd.send`, `cmd.delete`, `cmd.announce`) or through
+  lxmf's own command keys (`cmd.send`, `cmd.delete`, `cmd.announce`) or through
   fields lxmf does not own (`handed`). Writing a status or deleting a store file
   directly would race lxmf's delivery queue on its own data.
 - **`nowS()` is monotonic; `wallS()` is the clock.** The retention sweep
@@ -342,7 +342,7 @@ re-sends.
   off `lxmfSlotForDest`, which is the fact.
 - **Nothing on this task may block on lxmf.** Both identity operations use the
   async form; the sync ones park this task for up to five seconds with every
-  other session's mail behind them, and from the storage-task sentinel they
+  other session's mail behind them, and from the storage-task command key they
   would have the storage actor wait on itself.
 - **A repeat HANDOVER is a no-op, not a re-import.** A client that missed the
   `SERVING` re-sends it; importing again would take a second identity slot for
