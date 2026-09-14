@@ -18,7 +18,7 @@ per accepted Channel                            one session_t
 sessIdentify(): derive the account's dest, look up its slot, send HELLO
  ↓ every second, and on any write under s.lxmf.id.
 pushScan(): walk this account's records → MSG for what is owed, STATUS for what
- ↓          moved, STATE for what only this box knows; apply the quota gate
+ ↓          has FINISHED, STATE for what only this box knows; quota gate
 hourly: retentionSweep()
 ```
 
@@ -173,48 +173,99 @@ this task for up to five seconds with every other session's mail behind it.
 callback carries no ctx pointer, so the accumulator is file-scope, as lxmf's own
 scans are) and does three things:
 
-- **inbound with `handed == 0`, and not pushed in the last
-  `LXMPROXY_REPUSH_S`** → `MSG`, with the body inline when it is within the
-  inline threshold and `nil` when it is not. Its bytes count toward `owed`.
-  `sent_msg_s` remembers when each was last offered, keyed `"<peer>/<key>"` —
-  the inbound half of what `sent_status` does for outbound, and necessary for
-  the same reason. `handed` is an acknowledgement, not a record of having sent:
-  it cannot arrive until the client has stored the body, which is seconds away
-  on a radio and never at all while the client is off the air. Scanning on that
-  alone re-sent every unacknowledged message on every pass, so one arrival cost
-  a push per scan — thirteen frames in half a second for a single message, into
-  a Channel window five deep. The Channel already sequences and resends what
-  goes unproved, so the interval is a backstop for a frame it gave up on rather
-  than the delivery mechanism, which is why it is far longer than the scan
-  period. The ledger is pruned to the rows each scan actually saw.
-- **outbound whose status has moved, and which the client has not acknowledged**
-  → `STATUS`, carrying `message_id` so the client can map its local key onto
-  this box's record. `sent_status` remembers what was last relayed, keyed
-  `"<peer>/<key>"`, and `SETTLED` is what clears the entry. The `handed` skip is
-  the other half of that and is load-bearing, not tidiness: `SETTLED` clears the
-  `sent_status` entry but only *asks* lxmf to delete the record, which happens
-  on lxmf's task, so without the skip the next scan finds an unremembered
-  terminal record and relays its status again — drawing another `SETTLED`,
-  another delete, and one "deleted msg" line per scan until the record finally
-  goes. Both acks are idempotent for the same reason: a `HANDED`/`SETTLED` for a
-  record already marked `handed` is a repeat of the frame, not a second
-  handover, and re-issues nothing.
+- **inbound with `handed == 0` and `offered == 0`** → `MSG`, with the body
+  inline when it is within the inline threshold and `nil` when it is not. Its
+  bytes count toward `owed`, and `offered` is set on the record the moment the
+  frame goes out. `reply_to` and the quoted fragment ride on the offer as well
+  as on `BODY`, because a reply short enough to be carried inline is never
+  fetched and would otherwise reach the client as an ordinary message.
+
+  **An offer is made once.** `handed` is an acknowledgement, not a record of
+  having sent, and it cannot arrive until the client has stored the body —
+  which for a withheld body means *never*, until somebody downloads it. So
+  anything keyed on `handed` alone re-announces those forever. It was a
+  per-session map on a two-minute timer, which is how three long messages came
+  to re-announce themselves every two minutes for hours: the client had them,
+  could not acknowledge them, and the timer did not care. The Channel already
+  sequences and resends what goes unproved, so repeating the offer above it was
+  never the thing delivering anything.
+- **outbound that has stopped moving, and whose outcome the client has not
+  acknowledged** → `STATUS`, carrying `message_id` so the client can map its
+  local key onto this box's record. **One per message, and it is the outcome.**
+  `lxmfStatusIsVerdict()` in `lxmf.h` is the test, shared by both ends: a status
+  nothing is going to change. This box's own progress — queued, path request,
+  sending, awaiting proof, the link retries — is commentary on work the client
+  cannot join in with and cannot act on, and relaying each move of it spent four
+  frames of a 4 kbps radio per message saying so. That the message arrived here
+  at all is not news either: the client watched its own `SEND` go out over a
+  Channel that is proved end to end, and writes its own ✓ from that.
+
+  What the client has been told lives **on the record**, as `told` — the status
+  last relayed, stored `+1` so that `0` means "nothing told yet". Equal to the
+  current status *is* "the client knows"; there is no separate flag to keep in
+  step with the status it describes. It earns its keep across a reconnect that
+  interrupted a verdict, and says nothing else.
+
+  **THE PROOF IS THE ACKNOWLEDGEMENT.** A record whose verdict is `told` is
+  finalised — deleted, or marked `handed` under `keep_handed` — on the first
+  scan that finds `rnsd.chan.<tag>.outstanding` at zero. That number is a
+  delivery receipt for the whole channel: a Channel envelope is either proved by
+  the far side or the link is torn down trying, so nothing of ours unproved
+  means the client HAS everything sent. The confirmation already arrived, as the
+  115-byte proof the client's radio sent; a frame saying the same thing would
+  cost a further 131 bytes out and another proof back, per message, on a 4 kbps
+  link. Frame type 10 is reserved against one ever being added back.
+
+  It is read ONCE, at the top of `pushScan`, before a single frame goes out
+  below — a zero taken after this pass's own sends would be about a frame that
+  had not been written when rnsd last looked. rnsd publishes it from
+  `channelPollAll` rather than its 1 Hz tick for the same reason.
+
+  **A teardown un-tells whatever the dying Channel never proved.** Everything
+  proved has already been finalised by the scan above, so whatever is still here
+  when the link dies is exactly what was in flight — and it was not delivered,
+  because a Channel envelope is proved or the link is torn down trying, and this
+  *is* that teardown. `sessClose` clears `told` (and `offered`) on every
+  un-`handed` row of that account, and the next Channel says those again. Not a
+  pessimistic guess any more: the proof, or its absence, decides.
+
+  **`told` is persisted because a reconnect is not news.** It used to be a
+  `session_t` map, so a new Channel began with an empty ledger and re-announced
+  every record the box still held — one frame apiece, for a client that already
+  knew all of them. Measured on a real pair: seventeen terminal records, all of
+  them already known, re-sent as seventeen 163-byte Channel messages and
+  seventeen 115-byte proofs back, about 8.9 s of airtime for a node that had
+  just rebooted and had no new mail. Outbound status is exactly the fact that
+  survives a reconnect, so it is kept where the record is.
 - **the account's own state** → `STATE`, with the real announce time and how
   full the store is, so the client displays truth rather than intent.
 
-**What is left is what is owed.** There is no cursor and no resume position,
-because there is nothing to resume: a reconnect re-pushes the remainder and the
-client dedups on `message_id`. A client record held with the body still absent
-is a pending fetch, not a duplicate. A new Channel is a fresh `session_t`, so
-`sent_msg_s` starts empty and that re-push is immediate — the ledger paces a
-live session, and never delays a reconnect.
+**What is left is what is owed, and each piece of it is said once.** `offered`
+and `told` are both on the record, so neither a scan, a session nor a reboot
+makes this box repeat itself. The single thing that un-says either is the
+Channel going down with the frame still in it (`sessForgetUntold`) — a failed
+delivery, not a repeat. A client record held with the body still absent is a
+pending fetch, not a duplicate, and the client dedups on `message_id` in any
+case.
 
-**`handed` is set by `HANDED`, and by nothing else.** rnsd proves a packet the
-moment the hand-off to the consumer task succeeds, before anything is parsed or
-stored, and a Resource's conclusion is likewise pre-persist. Neither is a
-handover ack. The client sends `HANDED` once the record is in ITS storage with
-its body, which is why a withheld body is never deleted before someone fetches
-it.
+**A verdict for a record the client has forgotten settles itself.** The client
+logs a `STATUS` whose key it cannot find and answers nothing — receiving it is
+what settles it, and the Channel's proof has already said so, so the next scan
+here finalises the row like any other. Rows went immortal when a status could be
+relayed forever with nothing ever confirming it; now the confirmation is a
+property of the link rather than a frame the client has to choose to send, and a
+record whose client no longer has a copy stops being held. The outcome is lost
+either way, which is why the client logs it.
+
+**A MESSAGE is acknowledged; a STATUS is not — and the asymmetry is the point.**
+`HANDED` earns its frame by saying strictly more than the Channel's proof does:
+rnsd proves a packet the moment the hand-off to the consumer task succeeds,
+before anything is parsed or stored, and a Resource's conclusion is likewise
+pre-persist. Neither is a handover ack. The client sends
+`HANDED` once the record is in ITS storage with its body, which is why a
+withheld body is never deleted before someone fetches it. Mail is worth a frame
+to say it was kept. A status word is not — losing one costs a checkmark, and the
+proof already says the frame arrived.
 
 **Deletion is a policy.** `keep_handed` decides whether `HANDED` also deletes
 the record (via lxmf's `cmd.delete`, since lxmf owns the store). Today's policy
@@ -223,12 +274,18 @@ than a protocol revision.
 
 ### The inline threshold
 
-`lxmproxyInlineThreshold(rtt_ms, override)` (lxmf's `lxmproxy_wire.cpp`), fed
-from `rnsd.chan.<tag>.rtt_ms` — continuously re-measured on a held link — and
-`s.lxmproxy.inline_bytes` as the override. It scales inversely with the round
-trip from 8 KB at 250 ms, clamped to [256 B, 16 KB]. The clamp is what stops a
-first-measurement outlier from either withholding everything or pushing a body
-over a radio for minutes.
+`s.lxmproxy.inline_bytes`, **2048 by default**: a body up to that rides with
+the offer, a bigger one is withheld and fetched on demand.
+
+Set it to 0 and the size is derived instead, by
+`lxmproxyInlineThreshold(rtt_ms, override)` (lxmf's `lxmproxy_wire.cpp`) —
+inversely with the round trip, 8 KB at 250 ms, clamped to [256 B, 16 KB]. That
+was the default until it turned out not to work here: it reads
+`rnsd.chan.<tag>.rtt_ms`, which rnsd publishes when a channel this device
+**dialled** goes active and not when one dialled TO it does — and a proxy only
+ever has the latter. So the measurement was always missing, the clamp always
+returned its 256 B floor, and every message longer than about two lines was
+withheld. A plain number cannot fail that way.
 
 ### Quota
 
@@ -249,7 +306,9 @@ accepts, and whoever wants it shut re-asserts.
 
 The client's local key is the idempotency key. `handleSend` returns early on a
 record that already exists — a `SEND` repeated after a reconnect meets the same
-record — and only clears `sent_status` so the next scan re-reports its status.
+record — and only clears `told`, so the next scan says the status afresh. A
+client repeating a `SEND` is one that has not seen a status, whatever this box
+believes it has already said.
 
 The draft is reproduced exactly as the client wrote it, **the client's own
 timestamp included**, so the `message_id` both ends derive is the same one. Then
@@ -258,7 +317,30 @@ and `delivery_timeout` from there. The `pn:` third segment carries a
 propagation-node target through unchanged.
 
 An oversize body is refused with `TOO_LARGE` on the spot rather than written and
-failed, so the client sees the reason immediately.
+failed, so the client sees the reason immediately — though a current client
+never gets that far: `HELLO` states `max_envelope_kb`, and the client refuses an
+oversize draft itself rather than spending the air on a body only to be told.
+The refusal here is the backstop for a client that ignored its own ceiling, and
+keeps the box's own verdicts meaning "it tried and could not".
+
+### DROP and RETRY
+
+Two frames that name a record and move nothing, because the body is already on
+both ends.
+
+`DROP` is a delete on the client reaching the box: cancel the record if it has
+not left yet (`cmd.cancel`, which settles it `CANCELLED` and stops lxmf's queue
+retrying it) and then remove it. Deleting a message on the device it was written
+on and leaving a machine elsewhere still sending it is the one outcome nobody
+would expect from a delete. Nothing is answered — there is no state left to
+report.
+
+`RETRY` is "try that one now". A record that gave up is queued afresh
+(`tries = 0`, status back to `DRAFT`, `cmd.send`); one merely waiting for the
+next sweep stops waiting. `told` is cleared with it, so the status this produces
+is relayed even where it lands on the value the client already holds. The answer
+is the ordinary `STATUS` that follows — there is no dedicated reply, because a
+retry that produced no status change would have nothing to say.
 
 ## 7. RELEASE
 
@@ -321,10 +403,17 @@ pipe with). A larger frame goes as a Resource on the Channel's hidden Link via
 `lxmproxyParse` does not care which arrived.
 
 Inbound Resources land on the shared aux port and are matched to a session
-through `rnsd.chan.byid.<link_id>` → the tag. Outbound ones are acknowledged by
-the protocol (`HANDED` / `SETTLED` / `STATUS`) and never by the transfer, so
-their completion aux settles nothing; a failure is logged and the next scan
-re-sends.
+through `rnsd.chan.byid.<link_id>` → the tag.
+
+**An outbound Resource that fails has to un-say what it carried.** A record is
+marked said — `offered` for an inbound `MSG`, `told` for an outbound `STATUS` —
+the moment the frame is handed over, and each is said exactly once, so a
+transfer that fails halfway would otherwise leave a record claiming the client
+knows something it never saw. `s_pendingRes` correlates the `opaque_id` a frame
+went out under with the record it says, the completion aux clears the field on
+`RNSD_LINK_RESOURCE_FAILED`, and the next scan says it again. The Channel
+closing covers the same ground more broadly (`sessForgetUntold`); this is the
+narrower case where the transfer fails and the Channel lives on.
 
 ## 10. Pitfalls
 

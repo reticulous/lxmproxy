@@ -13,7 +13,13 @@ the account becomes an ORDINARY lxmf identity here: it registers and announces
 its own address, and receives and sends its own mail
  ↓ loop, while that client is connected
 inbound → pushed over the Channel → the client stores it → HANDED → deleted here
-outbound ← SEND ← the client;  its real status goes back verbatim
+outbound ← SEND ← the client;  ONE status goes back, at the end: how it went,
+           and nothing comes back to acknowledge it — the Channel's own
+           delivery proof is the acknowledgement, and the record is deleted the
+           moment nothing of ours is unproved. A reconnect that interrupted a
+           verdict says it again, and says nothing else
+           ← DROP  the client deleted it: cancel it here if it has not gone
+           ← RETRY try that one now; the body never moves
  ↓ the client releases it
 RELEASE → deregister, hand the ratchets back → the account answers on its own
 device again
@@ -148,7 +154,7 @@ enabled switch are per identity and always apply.
 | `s.lxmproxy.max_envelope_kb` | `32` | Largest single message accepted from a client to send. (The inbound side of this is rnsd's own `s.lxmf.max_resource_size`, which is device-wide.) |
 | `s.lxmproxy.retain_days` | `7` | Unretrieved mail expires after this. `0` = never. |
 | `s.lxmproxy.keep_handed` | `0` | Keep a message after its owner confirms it has stored it. Only sensible where the store is large. |
-| `s.lxmproxy.inline_bytes` | `0` | Push bodies up to this size; larger ones are offered as a download. `0` derives it from each client's measured round trip. |
+| `s.lxmproxy.inline_bytes` | `2048` | Push bodies up to this size; larger ones are offered as a download the client fetches on demand. `0` derives it from the client's measured round trip instead — which a proxy never has, so it lands on its 256-byte floor and withholds almost everything. |
 | `s.lxmproxy.serves.<i>.{id,label}` | — | The approved accounts. `id` is the account's 32-hex Reticulum identity hash; this straddle is the array's only writer. |
 
 ### Runtime (`lxmproxy.*`, RAM)

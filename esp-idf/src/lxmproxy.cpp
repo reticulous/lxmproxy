@@ -65,18 +65,6 @@ static const char* TAG = "lxmproxy";
 /* How often an idle session re-scans lxmf's store for work. Storage changes
  * mark the session dirty and it scans at once; this is the backstop. */
 #define LXMPROXY_SCAN_PERIOD_S  10
-/* How long a pushed MSG is left to be acknowledged before a scan offers it
- * again. `handed` is the only thing that retires an inbound record, and it
- * cannot arrive until the client has stored the body — seconds away on a radio,
- * and never at all while the client is off the air. Without this a scan re-sent
- * every unacknowledged message it could still see, so one arrival became a
- * push per scan for as long as the ack took. The Channel is already reliable
- * (it sequences and resends what goes unproved), so this is the backstop for a
- * frame the Channel itself gave up on, not the delivery mechanism — which is
- * why it is far longer than the scan period. A reconnect clears the ledger and
- * re-offers everything at once, which is what makes the remainder resumable
- * with no cursor. */
-#define LXMPROXY_REPUSH_S       120
 /* The retention sweep is cheap and its unit is days — an hour is plenty. */
 #define LXMPROXY_SWEEP_PERIOD_S 3600
 /* Resource opaque ids for our outbound frames. */
@@ -116,17 +104,6 @@ struct session_t {
     std::string held_ratchets;
     uint32_t    id_deadline_s = 0;
 
-    /* The last outbound status relayed per message ("<peer>/<key>"), so a scan
-     * emits STATUS only on a change. Bounded by the outbound this box still
-     * holds, which SETTLED is what clears. */
-    std::map<std::string, uint8_t> sent_status;
-    /* When each inbound message was last pushed ("<peer>/<key>" → monotonic
-     * seconds), so a scan offers one again only after LXMPROXY_REPUSH_S rather
-     * than every time it walks a record the client has not acknowledged yet.
-     * This is the inbound half of what sent_status does for outbound; `handed`
-     * is an acknowledgement, not a record of having sent. Rebuilt from each
-     * scan's own rows, so it holds only what this box is still carrying. */
-    std::map<std::string, uint32_t> sent_msg_s;
     /* The last STATE relayed, so an idle scan puts nothing on the air. A
      * Channel message costs real airtime on a radio link, and "nothing has
      * changed" is not worth one. */
@@ -197,6 +174,10 @@ static uint32_t    quotaBytes(void){ return (uint32_t)storageGetInt("s.lxmproxy.
 static uint32_t    envelopeMax(void){ return (uint32_t)storageGetInt("s.lxmproxy.max_envelope_kb", 32) * 1024u; }
 static uint32_t    retainDays(void){ return (uint32_t)storageGetInt("s.lxmproxy.retain_days", 7); }
 static bool        keepHanded(void){ return storageGetInt("s.lxmproxy.keep_handed", 0) != 0; }
+static void        deleteRecord(int slot, const std::string& peer,
+                                const std::string& key);   /* fwd — the push scan
+                                * finalises a proved record, and it is defined
+                                * with the frame handlers that also delete. */
 
 static std::string serverLabel(void)
 {
@@ -268,15 +249,40 @@ static void servesRemove(const std::string& id_hex)
 
 /* ─────────────── frames out ─────────────── */
 
-static bool sendFrame(session_t& s, const std::vector<uint8_t>& frame)
+/* Frames still crossing to a client as a Resource, and which record each one
+ * says. A Resource is proved part by part and can fail halfway — and by then
+ * the record is already marked said (`offered` for an inbound MSG, `told` for
+ * an outbound STATUS) while the client has seen nothing. The failure is the
+ * signal to un-say it, and the next scan says it again.
+ *
+ * The Channel closing covers the same ground for everything un-acknowledged
+ * (`sessForgetUntold`); this is the narrower case where the transfer fails and
+ * the Channel lives on. Bounded by what one Channel carries at a time. */
+struct pending_res_t {
+    uint32_t    opaque;
+    int         slot;
+    std::string peer, key;
+    const char* field;      /* "offered" or "told" */
+};
+static std::vector<pending_res_t> s_pendingRes;
+
+/* `opaque_out`, when given, is set to the Resource id a frame too big for one
+ * Channel message went out under, and left at 0 for one that fitted. */
+static bool sendFrame(session_t& s, const std::vector<uint8_t>& frame,
+                      uint32_t* opaque_out = nullptr)
 {
+    if (opaque_out) *opaque_out = 0;
     if (s.handle < 0) return false;
     if (frame.size() > LXMPROXY_MSG_MAX) {
         void* buf = gp_alloc(frame.size());
         if (!buf) { warn("[%s] resource malloc %zuB failed", TAG, frame.size()); return false; }
         std::memcpy(buf, frame.data(), frame.size());
+        uint32_t opaque = s_opaque++;
         /* rnsd owns buf from here and frees it once the engine has copied it. */
-        return rnsdChannelSendResource(s.tag.c_str(), buf, frame.size(), s_opaque++);
+        if (!rnsdChannelSendResource(s.tag.c_str(), buf, frame.size(), opaque))
+            return false;
+        if (opaque_out) *opaque_out = opaque;
+        return true;
     }
     std::vector<uint8_t> msg;
     msg.reserve(2 + frame.size());
@@ -294,7 +300,7 @@ static bool sendFrame(session_t& s, const std::vector<uint8_t>& frame)
 struct RecordRow {
     std::string peer, key;
     std::string dir, title, message_id;
-    int  status = -1, tries = 0, handed = 0, body_absent = 0;
+    int  status = -1, tries = 0, handed = 0, body_absent = 0, told = 0, offered = 0;
     int  ts = 0, body_size = 0;
 };
 
@@ -332,6 +338,8 @@ static void scanLeaf(const char* key, const char* val)
     else if (field == "status")      s_scanCur.status = val ? atoi(val) : -1;
     else if (field == "tries")       s_scanCur.tries = val ? atoi(val) : 0;
     else if (field == "handed")      s_scanCur.handed = val ? atoi(val) : 0;
+    else if (field == "told")        s_scanCur.told = val ? atoi(val) : 0;
+    else if (field == "offered")     s_scanCur.offered = val ? atoi(val) : 0;
     else if (field == "body_absent") s_scanCur.body_absent = val ? atoi(val) : 0;
     else if (field == "body_size")   s_scanCur.body_size = val ? atoi(val) : 0;
     else if (field == "ts")          s_scanCur.ts = val ? atoi(val) : 0;
@@ -397,15 +405,16 @@ static void pushScan(session_t& s)
     std::vector<RecordRow> rows;
     scanAccount(s.slot, rows);
 
+    /* Nothing of ours is still unproved on the Channel — so everything already
+     * sent has been received. Read ONCE, here, before a single frame goes out
+     * below: a zero taken after this pass's own sends would be about the frame
+     * that had not been written yet when rnsd last looked. */
+    bool chan_idle =
+        storageGetInt(("rnsd.chan." + s.tag + ".outstanding").c_str(), -1) == 0;
+
     uint32_t owed = 0;
     uint32_t inline_max = inlineThreshold(s);
-    uint32_t now_s = nowS();
     int pushed = 0;
-    /* The push ledger, rebuilt from the rows this scan actually walked and
-     * swapped in at the end. Carrying entries over one at a time would leave
-     * behind whatever the scan no longer finds — handed over, expired, deleted
-     * — so it is rebuilt rather than pruned. */
-    std::map<std::string, uint32_t> still_held;
 
     for (const RecordRow& r : rows) {
         uint8_t mid[LXMPROXY_MID_LEN], peer[16];
@@ -414,27 +423,43 @@ static void pushScan(session_t& s)
         if (r.dir == "in") {
             if (r.handed) continue;
             owed += (uint32_t)r.body_size;
+            /* Said once. `offered` is on the record, so it outlives the scan,
+             * the session and a reboot.
+             *
+             * It used to be a per-session map with a two-minute timer, which
+             * meant a message the client held but had not acknowledged was
+             * announced again every two minutes for as long as both were up. A
+             * withheld body is exactly that case — the client cannot
+             * acknowledge one until somebody downloads it — so three long
+             * messages sat there re-announcing themselves indefinitely. The
+             * Channel already retransmits what goes unproved, so repeating the
+             * offer above it was never the thing delivering it. */
+            if (r.offered) continue;
             /* Inbound records are keyed by the real message_id. */
             if (!fromHex(r.key, mid, LXMPROXY_MID_LEN)) continue;
-            std::string mk = r.peer + "/" + r.key;
-            /* Offered recently enough that the client has not had time to
-             * answer: the Channel is still carrying that frame, and sending it
-             * again would only spend airtime racing its own resend. */
-            auto sent = s.sent_msg_s.find(mk);
-            if (sent != s.sent_msg_s.end() && now_s - sent->second < LXMPROXY_REPUSH_S) {
-                still_held[mk] = sent->second;
-                continue;
-            }
             std::string content =
                 storageGetStr(msgKey(s.slot, r.peer, r.key, "content").c_str(), "");
             bool inlineBody = content.size() <= inline_max;
             std::string name =
                 storageGetStr(("s.lxmf.id." + std::to_string(s.slot) + ".contacts." +
                                r.peer + ".display_name").c_str(), "");
+            /* What the message replies to goes with the offer, not only with a
+             * body the client may never fetch. */
+            std::string rt =
+                storageGetStr(msgKey(s.slot, r.peer, r.key, "reply_to").c_str(), "");
+            std::string quote =
+                storageGetStr(msgKey(s.slot, r.peer, r.key, "reply_quote").c_str(), "");
+            uint8_t rtb[LXMPROXY_MID_LEN];
+            bool have_rt = fromHex(rt, rtb, LXMPROXY_MID_LEN);
+            uint32_t opaque = 0;
             if (sendFrame(s, lxmproxyBuildMsg(mid, peer, name.c_str(), (uint32_t)r.ts,
                                               r.title, (uint32_t)content.size(),
-                                              inlineBody ? &content : nullptr))) {
-                still_held[mk] = now_s;
+                                              inlineBody ? &content : nullptr,
+                                              have_rt ? rtb : nullptr, quote),
+                          &opaque)) {
+                storageSet(msgKey(s.slot, r.peer, r.key, "offered").c_str(), 1);
+                if (opaque)
+                    s_pendingRes.push_back({ opaque, s.slot, r.peer, r.key, "offered" });
                 pushed++;
             }
             continue;
@@ -444,32 +469,44 @@ static void pushScan(session_t& s)
          * the quota so a client cannot fill the box from the other side. */
         owed += (uint32_t)r.body_size;
 
-        /* Acknowledged: the client has this record's final status and said so.
-         * Re-announcing it would draw another SETTLED, and every SETTLED
-         * re-issues the delete — which lxmf performs on its own task, so the
-         * record is still here on the next scan. That is a loop, and it shows
-         * up as the same message being deleted several times. */
-        if (r.handed) continue;
-
-        /* Relay the account's real status the moment it moves. The
-         * first STATUS carries the message_id, which is what maps the client's
-         * local key onto this box's record. DRAFT is skipped: it is the state a
-         * record is written in, a tick before lxmf's queue picks it up, and
-         * relaying it would settle the client's copy on a status that means
-         * "not sent yet". */
-        if (r.status <= LXMF_ST_DRAFT) continue;
-        std::string mk = r.peer + "/" + r.key;
-        auto it = s.sent_status.find(mk);
+        /* ONE STATUS per outgoing message, and it is the outcome. This box's
+         * own progress — queued, path request, sending, awaiting proof, the
+         * link retries — is commentary on work the client cannot join in with
+         * and cannot act on, and relaying each move of it spent four frames of
+         * a 4 kbps radio saying so. The client already knows the message got
+         * here: it watched its own SEND go out. What it does not know is how it
+         * ended, and that is what crosses. */
+        if (!lxmfStatusIsVerdict((uint8_t)r.status)) continue;
         uint8_t st = (uint8_t)r.status;
-        if (it != s.sent_status.end() && it->second == st) continue;
+        /* THE PROOF IS THE ACKNOWLEDGEMENT.
+         *
+         * `told` says this box has put the verdict on the Channel. A Channel
+         * envelope is either proved by the far side or the link is torn down
+         * trying, so an idle Channel — nothing of ours unproved — means the
+         * client HAS it. That is the whole confirmation, and it arrived as the
+         * 115-byte proof the client's radio already sent. Asking for a frame
+         * that says the same thing cost a further 131 bytes out and another
+         * proof back, on a 4 kbps link, per message.
+         *
+         * Read at scan entry and before anything is sent below, so a zero can
+         * never be about a frame written later in this same pass. */
+        if (r.told == (int)st + 1) {
+            if (!chan_idle) continue;      /* still unproved — say nothing, wait */
+            if (!keepHanded())             deleteRecord(s.slot, r.peer, r.key);
+            else if (!r.handed)            storageSet(msgKey(s.slot, r.peer, r.key,
+                                                             "handed").c_str(), 1);
+            continue;
+        }
         uint8_t midbuf[LXMPROXY_MID_LEN];
         bool have_mid = fromHex(r.message_id, midbuf, LXMPROXY_MID_LEN);
+        uint32_t opaque = 0;
         if (sendFrame(s, lxmproxyBuildStatus(r.key, peer, st, (uint32_t)r.ts,
-                                             have_mid ? midbuf : nullptr)))
-            s.sent_status[mk] = st;
+                                             have_mid ? midbuf : nullptr), &opaque)) {
+            storageSet(msgKey(s.slot, r.peer, r.key, "told").c_str(), (int)st + 1);
+            if (opaque)
+                s_pendingRes.push_back({ opaque, s.slot, r.peer, r.key, "told" });
+        }
     }
-
-    s.sent_msg_s.swap(still_held);
 
     applyQuota(s, owed);
     s.owed_bytes = owed;
@@ -621,7 +658,10 @@ static void handleSend(session_t& s, const LxmproxyFrame& fr)
      * meets this same record and gets the same STATUS. A record already past
      * DRAFT is one we have; do not restart it. */
     if (storageExists(msgKey(s.slot, peer, fr.key, "status").c_str())) {
-        s.sent_status.erase(peer + "/" + fr.key);   /* re-report on the next scan */
+        /* A repeated SEND is a client asking again because it has not seen a
+         * status — so forget having told it and let the next scan say it
+         * afresh, whatever the status is by now. */
+        storageSet(msgKey(s.slot, peer, fr.key, "told").c_str(), 0);
         return;
     }
     /* Reproduce the draft exactly as the client wrote it — the client's own
@@ -636,9 +676,13 @@ static void handleSend(session_t& s, const LxmproxyFrame& fr)
     storageSet(msgKey(s.slot, peer, fr.key, "body_size").c_str(), (int)fr.content.size());
     storageSet(msgKey(s.slot, peer, fr.key, "ts").c_str(),      (int)fr.ts);
     storageSet(msgKey(s.slot, peer, fr.key, "status").c_str(),  0 /* DRAFT */);
-    if (fr.have_reply_to)
+    if (fr.have_reply_to) {
         storageSet(msgKey(s.slot, peer, fr.key, "reply_to").c_str(),
                    toHex(fr.reply_to, LXMPROXY_MID_LEN).c_str());
+        if (!fr.reply_quote.empty())
+            storageSet(msgKey(s.slot, peer, fr.key, "reply_quote").c_str(),
+                       fr.reply_quote.c_str());
+    }
     if (!fr.method.empty())
         storageSet(msgKey(s.slot, peer, fr.key, "method").c_str(), fr.method.c_str());
     char cmd[48], val[128];
@@ -754,8 +798,6 @@ static void handleRelease(session_t& s)
     s.serving          = false;
     s.awaiting_release = true;
     s.id_deadline_s    = nowS() + LXMPROXY_IDENTITY_WAIT_S;
-    s.sent_status.clear();
-    s.sent_msg_s.clear();
     lxmfDestroyIdentity(s.releasing_slot, /*sync=*/false);
 }
 
@@ -782,10 +824,11 @@ static void handleFrame(session_t& s, const LxmproxyFrame& fr)
         std::string mid  = toHex(fr.msg_id, LXMPROXY_MID_LEN);
         std::string content = storageGetStr(msgKey(s.slot, peer, mid, "content").c_str(), "");
         std::string rt      = storageGetStr(msgKey(s.slot, peer, mid, "reply_to").c_str(), "");
+        std::string quote   = storageGetStr(msgKey(s.slot, peer, mid, "reply_quote").c_str(), "");
         uint8_t rtb[LXMPROXY_MID_LEN];
         bool have_rt = fromHex(rt, rtb, LXMPROXY_MID_LEN);
         sendFrame(s, lxmproxyBuildBody(fr.msg_id, fr.peer, content,
-                                       have_rt ? rtb : nullptr));
+                                       have_rt ? rtb : nullptr, quote));
         break;
     }
     case LXMPROXY_FR_HANDED: {
@@ -804,15 +847,44 @@ static void handleFrame(session_t& s, const LxmproxyFrame& fr)
         s.dirty = true;
         break;
     }
-    case LXMPROXY_FR_SETTLED: {
+    case LXMPROXY_FR_DROP: {
+        /* Deleted on the device it was written on. Cancel it if it has not left
+         * yet — lxmf's cancel settles the record CANCELLED and stops the queue
+         * retrying it — and then remove it, since nothing here is owed to a
+         * client that has thrown its own copy away. No answer: there is no
+         * state left to report. */
         if (s.slot < 0) break;
         std::string peer = toHex(fr.peer, 16);
         if (!storageExists(msgKey(s.slot, peer, fr.key, "status").c_str())) break;
-        if (storageGetInt(msgKey(s.slot, peer, fr.key, "handed").c_str(), 0)) break;
-        storageSet(msgKey(s.slot, peer, fr.key, "handed").c_str(), 1);
-        if (!keepHanded()) deleteRecord(s.slot, peer, fr.key);
-        s.sent_status.erase(peer + "/" + fr.key);
+        char k[48], v[128];
+        std::snprintf(k, sizeof k, "lxmf.id.%d.cmd.cancel", s.slot);
+        std::snprintf(v, sizeof v, "%s/%s", peer.c_str(), fr.key.c_str());
+        storageSet(k, v);
+        deleteRecord(s.slot, peer, fr.key);
         s.dirty = true;
+        dbg("[%s] %s: DROP %s → %s", TAG, s.dest_hex.c_str(), fr.key.c_str(), peer.c_str());
+        break;
+    }
+    case LXMPROXY_FR_RETRY: {
+        /* Try it now. A record that gave up is put back in the queue; one still
+         * waiting for the next sweep is brought forward. Either way the body
+         * never moves — that is the point of the frame — and `told` is cleared
+         * so the status this produces is relayed even where it lands on the
+         * same value the client already has. */
+        if (s.slot < 0) break;
+        std::string peer = toHex(fr.peer, 16);
+        if (!storageExists(msgKey(s.slot, peer, fr.key, "status").c_str())) break;
+        storageBegin();
+        storageSet(msgKey(s.slot, peer, fr.key, "told").c_str(), 0);
+        storageSet(msgKey(s.slot, peer, fr.key, "tries").c_str(), 0);
+        storageSet(msgKey(s.slot, peer, fr.key, "status").c_str(), (int)LXMF_ST_DRAFT);
+        char k[48], v[128];
+        std::snprintf(k, sizeof k, "lxmf.id.%d.cmd.send", s.slot);
+        std::snprintf(v, sizeof v, "%s/%s", peer.c_str(), fr.key.c_str());
+        storageSet(k, v);
+        storageEnd();
+        s.dirty = true;
+        dbg("[%s] %s: RETRY %s → %s", TAG, s.dest_hex.c_str(), fr.key.c_str(), peer.c_str());
         break;
     }
     default:
@@ -898,8 +970,41 @@ static session_t* sessByHandle(int handle)
     return nullptr;
 }
 
+/* Forget having told the client anything the dying Channel never proved.
+ *
+ * `told` and `offered` mean "said on a Channel that was alive when we said it".
+ * A proved envelope has already been finalised by the scan — the record is
+ * gone, or `handed` — so whatever is still here when the link dies is exactly
+ * what was in flight, and it was NOT delivered: a Channel envelope is proved or
+ * the link is torn down trying, and this is that teardown. Not pessimism any
+ * more; the proof, or its absence, decides. */
+static void sessForgetUntold(const session_t& s)
+{
+    if (s.slot < 0) return;
+    std::vector<RecordRow> rows;
+    scanAccount(s.slot, rows);
+    for (const RecordRow& r : rows) {
+        if (r.handed) continue;
+        /* Outbound: a status said on a Channel that then died. */
+        if (r.dir == "out" && r.told)
+            storageSet(msgKey(s.slot, r.peer, r.key, "told").c_str(), 0);
+        /* Inbound: an offer said on one. The offer is made ONCE — the only
+         * thing that makes it again is the Channel going down before it could
+         * land, which is a failed delivery rather than a repeat. */
+        else if (r.dir == "in" && r.offered)
+            storageSet(msgKey(s.slot, r.peer, r.key, "offered").c_str(), 0);
+    }
+}
+
 static void sessClose(session_t& s)
 {
+    sessForgetUntold(s);
+    /* Resources still crossing on this Channel will never echo now.
+     * sessForgetUntold has already un-said every record they carried, so the
+     * correlations are spent. */
+    for (size_t i = s_pendingRes.size(); i-- > 0; )
+        if (s_pendingRes[i].slot == s.slot)
+            s_pendingRes.erase(s_pendingRes.begin() + i);
     if (s.handle >= 0) itsDisconnect(s.handle);
     s = session_t{};
 }
@@ -954,6 +1059,21 @@ static void onResourceAux(TaskHandle_t /*sender*/, const void* data, size_t len)
     rnsd_link_resource_done_t d;
     std::memcpy(&d, data, sizeof d);
     if (d.opcode != RNSD_LINK_RESOURCE_INBOUND_DONE) {
+        /* An outbound transfer has ended, one way or the other. Done: the frame
+         * is across and the record's `offered`/`told` is true. Failed: it is
+         * not, and the record says otherwise — un-say it, and the next scan
+         * says it again. */
+        for (size_t i = 0; i < s_pendingRes.size(); ++i) {
+            if (s_pendingRes[i].opaque != d.opaque_id) continue;
+            if (d.opcode == RNSD_LINK_RESOURCE_FAILED) {
+                const pending_res_t& pr = s_pendingRes[i];
+                warn("[%s] resource carrying %s/%s failed — un-saying %s",
+                     TAG, pr.peer.c_str(), pr.key.c_str(), pr.field);
+                storageSet(msgKey(pr.slot, pr.peer, pr.key, pr.field).c_str(), 0);
+            }
+            s_pendingRes.erase(s_pendingRes.begin() + i);
+            return;
+        }
         if (d.opcode == RNSD_LINK_RESOURCE_FAILED)
             warn("[%s] outbound resource failed (opaque=%u)", TAG, (unsigned)d.opaque_id);
         return;
@@ -1337,8 +1457,6 @@ static void lxmproxyTask(void*)
                 s.serving          = false;
                 s.awaiting_release = true;
                 s.id_deadline_s    = now_s + LXMPROXY_IDENTITY_WAIT_S;
-                s.sent_status.clear();
-                s.sent_msg_s.clear();
                 lxmfDestroyIdentity(s.releasing_slot, /*sync=*/false);
             }
             /* Just approved, and the client is sitting on the Channel waiting
@@ -1404,7 +1522,16 @@ void LxmproxyService::onInit()
         storageDefault("s.lxmproxy.max_envelope_kb", 32);
         storageDefault("s.lxmproxy.retain_days", 7);
         storageDefault("s.lxmproxy.keep_handed", 0);
-        storageDefault("s.lxmproxy.inline_bytes", 0);
+        /* A body up to this rides along with the offer; anything bigger is
+         * withheld and fetched on demand. A plain number rather than something
+         * derived from the link speed: the derivation read the channel's
+         * measured round trip, which rnsd publishes for channels this device
+         * DIALS and not for the ones dialled to it — and a proxy only ever has
+         * the latter. So it always read "no measurement" and fell back to its
+         * smallest limit, 256 bytes, which withholds every message longer than
+         * about two lines. 0 still selects the derived behaviour for anyone who
+         * wants it. */
+        storageDefault("s.lxmproxy.inline_bytes", 2048);
         storageDefaultTree("s.lxmproxy", "{\"serves\":[]}");
         storageSet("s.lxmproxy.version", LXMPROXY_VERSION);
         storageEnd();
