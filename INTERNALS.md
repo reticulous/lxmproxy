@@ -311,7 +311,10 @@ client repeating a `SEND` is one that has not seen a status, whatever this box
 believes it has already said.
 
 The draft is reproduced exactly as the client wrote it, **the client's own
-timestamp included**, so the `message_id` both ends derive is the same one. Then
+timestamp included**, so the `message_id` both ends derive is the same one —
+lxmf's `resolveOutboundWire` packs a record's stored `ts` rather than stamping
+the moment it transmits, so a message written on the owner's device hours before
+this box had a path still says when it was written. Then
 `lxmf.id.<slot>.cmd.send` hands it to lxmf's queue, which owns retry, backoff
 and `delivery_timeout` from there. The `pn:` third segment carries a
 propagation-node target through unchanged.
