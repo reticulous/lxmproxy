@@ -59,7 +59,7 @@ static const char* TAG = "lxmproxy";
 #define LXMPROXY_IDENTITY_KEY   "secrets.lxmproxy.identity"
 /* One Channel per served account, and the accounts are bounded by lxmf's own
  * identity slots — a hosted account IS an lxmf identity. */
-#define LXMPROXY_MAX_SESSIONS   4
+#define LXMPROXY_MAX_SESSIONS   LXMF_MAX_IDENTITIES
 /* A Channel whose initiator never identifies is not a client of ours. */
 #define LXMPROXY_IDENT_WAIT_S   45
 /* How often an idle session re-scans lxmf's store for work. Storage changes
@@ -103,6 +103,10 @@ struct session_t {
     int         releasing_slot = -1;
     std::string held_ratchets;
     uint32_t    id_deadline_s = 0;
+    /* A group's member list from its HANDOVER, applied once the slot exists. */
+    std::string handover_members;
+    /* A group its owner has deleted: lxmf is saying so and will drop the slot. */
+    bool        ending = false;
 
     /* The last STATE relayed, so an idle scan puts nothing on the air. A
      * Channel message costs real airtime on a radio link, and "nothing has
@@ -167,6 +171,27 @@ static std::string msgKey(int slot, const std::string& peer,
     std::snprintf(b, sizeof b, "s.lxmf.id.%d.msgs.%s.%s.%s",
                   slot, peer.c_str(), key.c_str(), field);
     return b;
+}
+
+/* What a record replies to, as the wire carries it: the full 32-byte id, a
+ * group's 3-byte one, or nothing (0). */
+static size_t replyOf(int slot, const std::string& peer, const std::string& key,
+                      uint8_t out[LXMPROXY_MID_LEN])
+{
+    if (fromHex(storageGetStr(msgKey(slot, peer, key, "reply_to").c_str(), ""), out,
+                LXMPROXY_MID_LEN))
+        return LXMPROXY_MID_LEN;
+    if (fromHex(storageGetStr(msgKey(slot, peer, key, "reply_short").c_str(), ""), out,
+                LXMPROXY_SHORT_ID_LEN))
+        return LXMPROXY_SHORT_ID_LEN;
+    return 0;
+}
+
+/* A hosted group sends on what its members send it; it has no owner's device
+ * to push mail to and no statuses anybody is waiting for. */
+static bool isGroupSlot(int slot)
+{
+    return storageGetStr(("s.lxmf.id." + std::to_string(slot) + ".kind").c_str(), "") == "group";
 }
 
 static std::string quotaKb(void)   { return std::to_string(storageGetInt("s.lxmproxy.quota_kb", 64)); }
@@ -403,7 +428,7 @@ static void pushScan(session_t& s)
 {
     if (!s.serving || s.slot < 0) return;
     std::vector<RecordRow> rows;
-    scanAccount(s.slot, rows);
+    if (!isGroupSlot(s.slot)) scanAccount(s.slot, rows);
 
     /* Nothing of ours is still unproved on the Channel — so everything already
      * sent has been received. Read ONCE, here, before a single frame goes out
@@ -445,17 +470,31 @@ static void pushScan(session_t& s)
                                r.peer + ".display_name").c_str(), "");
             /* What the message replies to goes with the offer, not only with a
              * body the client may never fetch. */
-            std::string rt =
-                storageGetStr(msgKey(s.slot, r.peer, r.key, "reply_to").c_str(), "");
             std::string quote =
                 storageGetStr(msgKey(s.slot, r.peer, r.key, "reply_quote").c_str(), "");
             uint8_t rtb[LXMPROXY_MID_LEN];
-            bool have_rt = fromHex(rt, rtb, LXMPROXY_MID_LEN);
+            size_t rt_len = replyOf(s.slot, r.peer, r.key, rtb);
+            uint8_t gfrom[16], gorig[LXMPROXY_SHORT_ID_LEN];
+            bool have_group =
+                fromHex(storageGetStr(msgKey(s.slot, r.peer, r.key, "group_from").c_str(), ""),
+                        gfrom, 16) &&
+                fromHex(storageGetStr(msgKey(s.slot, r.peer, r.key, "orig_id").c_str(), ""),
+                        gorig, LXMPROXY_SHORT_ID_LEN);
             uint32_t opaque = 0;
             if (sendFrame(s, lxmproxyBuildMsg(mid, peer, name.c_str(), (uint32_t)r.ts,
                                               r.title, (uint32_t)content.size(),
                                               inlineBody ? &content : nullptr,
-                                              have_rt ? rtb : nullptr, quote),
+                                              rtb, rt_len, quote,
+                                              have_group ? gfrom : nullptr,
+                                              have_group ? gorig : nullptr,
+                                              (uint32_t)storageGetInt(msgKey(s.slot, r.peer, r.key,
+                                                  "group_event").c_str(), 0),
+                                              storageGetStr(msgKey(s.slot, r.peer, r.key,
+                                                  "group_subjects").c_str(), ""),
+                                              storageGetStr(msgKey(s.slot, r.peer, r.key,
+                                                  "group_data").c_str(), ""),
+                                              storageGetStr(msgKey(s.slot, r.peer, r.key,
+                                                  "group_name").c_str(), "")),
                           &opaque)) {
                 storageSet(msgKey(s.slot, r.peer, r.key, "offered").c_str(), 1);
                 if (opaque)
@@ -577,8 +616,10 @@ static void handleHandover(session_t& s, const LxmproxyFrame& fr)
         storageSet(("secrets.rnsd.ratchets." + s.dest_hex).c_str(), fr.ratchets.c_str());
 
     std::string priv = toHex(fr.privkey, 64);
+    bool group = !fr.members.empty();
     lxmfImportIdentity(priv.c_str(), fr.display_name.c_str(), "server",
-                       /*sync=*/false);
+                       /*sync=*/false, group ? "group" : nullptr);
+    s.handover_members = fr.members;
     s.awaiting_import = true;
     s.id_deadline_s   = nowS() + LXMPROXY_IDENTITY_WAIT_S;
     info("[%s] taking %s over as \"%s\"", TAG,
@@ -599,6 +640,12 @@ static void sessIdentityTick(session_t& s)
             s.serving = true;
             s.dirty   = true;
             info("[%s] serving %s as identity slot %d", TAG, s.dest_hex.c_str(), slot);
+            if (!s.handover_members.empty()) {
+                char k[48];
+                std::snprintf(k, sizeof k, "lxmf.id.%d.cmd.members_init", slot);
+                storageSet(k, s.handover_members.c_str());
+                s.handover_members.clear();
+            }
             sendFrame(s, lxmproxyBuildServing(true, ""));
         } else if (now_s >= s.id_deadline_s) {
             s.awaiting_import = false;
@@ -676,9 +723,13 @@ static void handleSend(session_t& s, const LxmproxyFrame& fr)
     storageSet(msgKey(s.slot, peer, fr.key, "body_size").c_str(), (int)fr.content.size());
     storageSet(msgKey(s.slot, peer, fr.key, "ts").c_str(),      (int)fr.ts);
     storageSet(msgKey(s.slot, peer, fr.key, "status").c_str(),  0 /* DRAFT */);
-    if (fr.have_reply_to) {
-        storageSet(msgKey(s.slot, peer, fr.key, "reply_to").c_str(),
-                   toHex(fr.reply_to, LXMPROXY_MID_LEN).c_str());
+    if (fr.have_reply_to || fr.have_reply_short) {
+        if (fr.have_reply_to)
+            storageSet(msgKey(s.slot, peer, fr.key, "reply_to").c_str(),
+                       toHex(fr.reply_to, LXMPROXY_MID_LEN).c_str());
+        else
+            storageSet(msgKey(s.slot, peer, fr.key, "reply_short").c_str(),
+                       toHex(fr.reply_short, LXMPROXY_SHORT_ID_LEN).c_str());
         if (!fr.reply_quote.empty())
             storageSet(msgKey(s.slot, peer, fr.key, "reply_quote").c_str(),
                        fr.reply_quote.c_str());
@@ -704,9 +755,9 @@ static void handleConfig(session_t& s, const LxmproxyFrame& fr)
     /* How many accounts THIS BOX HOSTS — not how many lxmf identities exist,
      * since the operator's own identity may well be one of them. */
     int accounts = 0;
-    for (int n = 0; n < 4; ++n)
+    for (int n = 0; n < LXMF_MAX_IDENTITIES; ++n)
         if (storageGetStr(("s.lxmf.id." + std::to_string(n) + ".proxy_role").c_str(),
-                          "off") == "server") accounts++;
+                          "off") == "server" && !isGroupSlot(n)) accounts++;
     for (const auto& kv : fr.map) {
         if (kv.first == "display_name") {
             std::string cur = storageGetStr(("s.lxmf.id." + std::to_string(s.slot) +
@@ -719,6 +770,37 @@ static void handleConfig(session_t& s, const LxmproxyFrame& fr)
         } else if (kv.first == "enabled") {
             storageSet(("s.lxmf.id." + std::to_string(s.slot) + ".enabled").c_str(),
                        atoi(kv.second.c_str()));
+        } else if (kv.first == "members") {
+            /* A group's member list, applied by lxmf; the changes are told
+             * from here, where the group is on the air. */
+            if (!kv.second.empty() && isGroupSlot(s.slot)) {
+                char k[48];
+                std::snprintf(k, sizeof k, "lxmf.id.%d.cmd.members_set", s.slot);
+                storageSet(k, kv.second.c_str());
+            }
+        } else if (kv.first == "hide_name") {
+            /* Whether the group's announce carries its name. */
+            if (isGroupSlot(s.slot)) {
+                std::string k = "s.lxmf.id." + std::to_string(s.slot) + ".hide_name";
+                int want = kv.second == "0" ? 0 : 1;
+                if (storageGetInt(k.c_str(), 1) != want) {
+                    storageSet(k.c_str(), want);
+                    announce = true;
+                }
+            }
+        } else if (kv.first == "ended") {
+            /* The owner deleted the group: lxmf tells everyone from here and
+             * drops the slot once that is out, and this box stops having
+             * agreed to host it. `ending` keeps the approval's removal from
+             * being read as a revoke, which would take the slot — and the
+             * notice still on its way out — at once. */
+            if (kv.second == "1" && isGroupSlot(s.slot) && !s.ending) {
+                s.ending = true;
+                storageSet("lxmf.cmd.group_delete", std::to_string(s.slot).c_str());
+                servesRemove(s.ident_hex);
+                info("[%s] group %s deleted by its owner — no longer approved",
+                     TAG, s.dest_hex.c_str());
+            }
         } else if (kv.first == "stamp_cost" || kv.first == "enforce_stamps" ||
                    kv.first == "pn") {
             /* lxmf's stamp knobs and its propagation-node list are DEVICE-wide,
@@ -818,17 +900,28 @@ static void handleFrame(session_t& s, const LxmproxyFrame& fr)
     case LXMPROXY_FR_CONFIG:   handleConfig(s, fr);                   break;
     case LXMPROXY_FR_RELEASE:  handleRelease(s);                      break;
 
+    case LXMPROXY_FR_ADOPT: {
+        /* An account this box serves vouches for a group of its own: the group
+         * holds no approval of its own to wait for. */
+        if (!s.serving || s.slot < 0 || !fr.have_ident) break;
+        std::string id = toHex(fr.ident, RNSD_IDENT_HASH_LEN);
+        if (servesHas(id)) break;
+        servesAdd(id, fr.label);
+        s_servesDirty = true;
+        info("[%s] %s adopts group %s (\"%s\")", TAG, s.dest_hex.c_str(), id.c_str(),
+             fr.label.c_str());
+        break;
+    }
+
     case LXMPROXY_FR_FETCH: {
         if (!s.serving || s.slot < 0) break;
         std::string peer = toHex(fr.peer, 16);
         std::string mid  = toHex(fr.msg_id, LXMPROXY_MID_LEN);
         std::string content = storageGetStr(msgKey(s.slot, peer, mid, "content").c_str(), "");
-        std::string rt      = storageGetStr(msgKey(s.slot, peer, mid, "reply_to").c_str(), "");
         std::string quote   = storageGetStr(msgKey(s.slot, peer, mid, "reply_quote").c_str(), "");
         uint8_t rtb[LXMPROXY_MID_LEN];
-        bool have_rt = fromHex(rt, rtb, LXMPROXY_MID_LEN);
-        sendFrame(s, lxmproxyBuildBody(fr.msg_id, fr.peer, content,
-                                       have_rt ? rtb : nullptr, quote));
+        size_t rt_len = replyOf(s.slot, peer, mid, rtb);
+        sendFrame(s, lxmproxyBuildBody(fr.msg_id, fr.peer, content, rtb, rt_len, quote));
         break;
     }
     case LXMPROXY_FR_HANDED: {
@@ -1133,6 +1226,7 @@ static void sessIdentify(session_t& s)
             s.releasing_slot   = o.releasing_slot;
             s.held_ratchets    = o.held_ratchets;
             s.id_deadline_s    = o.id_deadline_s;
+            s.handover_members = o.handover_members;
         }
         sessClose(o);
     }
@@ -1183,7 +1277,7 @@ static void retentionSweep(void)
     uint32_t now = wallS();
     if (now < days * 86400u) return;   /* clock never synced — nothing has aged */
     uint32_t cutoff = now - days * 86400u;
-    for (int slot = 0; slot < 4; ++slot) {
+    for (int slot = 0; slot < LXMF_MAX_IDENTITIES; ++slot) {
         std::string role = storageGetStr(("s.lxmf.id." + std::to_string(slot) +
                                           ".proxy_role").c_str(), "off");
         if (role != "server") continue;
@@ -1449,7 +1543,7 @@ static void lxmproxyTask(void*)
             /* An account the operator has just un-approved stops being served
              * here — the identity slot goes, and its address with it. The
              * revoke sentinel only edits the list; this is where it takes. */
-            if (serves_dirty && s.serving && !servesHas(s.ident_hex)) {
+            if (serves_dirty && s.serving && !s.ending && !servesHas(s.ident_hex)) {
                 info("[%s] %s revoked — taking its address off the air here",
                      TAG, s.dest_hex.c_str());
                 s.releasing_slot   = s.slot;

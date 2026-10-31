@@ -397,6 +397,49 @@ its `HANDOVER`. Without that re-offer the client gave up on the refusal and the
 user had to ask to be proxied twice — once to make the request appear at all,
 and again after approving it.
 
+**A served account approves its own groups.** `ADOPT [identity, label]` on a
+serving session adds that identity to the list (label "<name> (group)") and
+marks the list dirty, so the group's own Channel — opened just after — is
+already approved and goes straight to `HANDOVER`. Only a session that is serving
+can vouch: the owner holds the group's key, and this box already agreed to host
+the owner.
+
+## 8b. Hosted groups
+
+```
+owner Channel  ADOPT [group identity, label]      → s.lxmproxy.serves
+group Channel  HANDOVER [key, name, ratchets, members]
+               → lxmfImportIdentity(…, "server", kind "group")
+               → slot appears: lxmf.id.<g>.cmd.members_init = members
+               ← SERVING
+               CONFIG {display_name, enabled, members, ended, hide_name}
+               → members: lxmf.id.<g>.cmd.members_set   (lxmf tells the changes)
+               → ended=1: lxmf.cmd.group_delete         (lxmf tells everyone, reaps)
+               → hide_name: s.lxmf.id.<g>.hide_name, re-announce on a change
+                 (an imported group starts at 1: nothing is announced before this)
+```
+
+A hosted group is an lxmf identity like any account, and lxmf does its fan-out
+and its notices (lxmf INTERNALS §8d). What differs here is what it is owed:
+nothing. `pushScan` walks no records for a group slot — there is no owner device
+to push its mail to and no client waiting on a status for what it sends — so a
+group's Channel carries the handshake and `CONFIG` and nothing else. A group is
+not counted among the box's accounts when deciding whether a device-wide setting
+can be honoured.
+
+`MSG` carries a message's `FIELD_GROUP` (`group_from`, the 3-byte `orig_id`,
+`group_event`, `group_subjects`, and `group_data` — an `/info` or `/members`
+answer, which lxmf stores on a hosted account for exactly this) for an account
+that is a group member, and a reply reference of 32 bytes or a group's 3
+(`MSG`, `BODY`, `SEND` alike). So its owner's device
+sees who wrote what and acts on the group's notices.
+
+**Deleting.** `ended=1` in a group's `CONFIG` hands lxmf `group_delete` and
+takes the group out of `s.lxmproxy.serves` at once; lxmf drops the slot itself
+once its notice is out. The session is marked `ending` so that removal is not
+read as an operator's revoke — a revoke destroys the slot immediately, and with
+it the "deleted the group" still in the delivery queue.
+
 ## 9. Frames over one Channel message
 
 `LXMPROXY_MSG_MAX` is 300 B — conservative against the channel MDU (the link MDU

@@ -51,7 +51,7 @@ share an account, and nobody else has to know.
   [lxmf](../lxmf) identity on this device, so lxmf's own store, delivery queue,
   retry, `delivery_timeout` and status transitions do all the work. There is no
   separate spool and no second copy of anything. Accounts per box are bounded by
-  lxmf's identity slots (four), and each costs one hosted destination in rnsd.
+  lxmf's identity slots (ten), and each costs one hosted destination in rnsd.
 - **Pushes mail live** to whichever client is connected, and holds it for the
   ones that are not.
 - **Sends on the account's behalf**, relaying the real `LxmfStatus` back so the
@@ -96,6 +96,14 @@ answered.
 Approving is the operator's decision about which accounts this box hosts;
 **holding the account key is the entitlement**, and the approval list is policy
 on top of it, not an authentication mechanism.
+
+**Groups come with their owner.** An lxmf group lives where its owner's account
+lives, so when you host an account its groups follow it here. They need no
+approval: the account vouches for them, and they appear in the approved list as
+"<name> (group)". Each takes an identity slot and a Channel from its owner's
+device, and does its members' fan-out from this box. When the owner deletes the
+group, this box tells the members, then drops the group and its approval by
+itself.
 
 **Messaging an account you host.** From another identity on this same device it
 works and never touches the radio: Reticulum keeps no path to its own
@@ -155,7 +163,7 @@ enabled switch are per identity and always apply.
 | `s.lxmproxy.retain_days` | `7` | Unretrieved mail expires after this. `0` = never. |
 | `s.lxmproxy.keep_handed` | `0` | Keep a message after its owner confirms it has stored it. Only sensible where the store is large. |
 | `s.lxmproxy.inline_bytes` | `2048` | Push bodies up to this size; larger ones are offered as a download the client fetches on demand. `0` derives it from the client's measured round trip instead — which a proxy never has, so it lands on its 256-byte floor and withholds almost everything. |
-| `s.lxmproxy.serves.<i>.{id,label}` | — | The approved accounts. `id` is the account's 32-hex Reticulum identity hash; this straddle is the array's only writer. |
+| `s.lxmproxy.serves.<i>.{id,label}` | — | The approved accounts. `id` is the account's 32-hex Reticulum identity hash; this straddle is the array's only writer. A served account's groups are added here by that account ("<name> (group)") and removed when its owner deletes the group. |
 
 ### Runtime (`lxmproxy.*`, RAM)
 
