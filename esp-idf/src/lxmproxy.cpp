@@ -491,7 +491,11 @@ static void pushScan(session_t& s)
                                               storageGetStr(msgKey(s.slot, r.peer, r.key,
                                                   "group_data").c_str(), ""),
                                               storageGetStr(msgKey(s.slot, r.peer, r.key,
-                                                  "group_name").c_str(), "")),
+                                                  "group_name").c_str(), ""),
+                                              (uint32_t)storageGetInt(msgKey(s.slot, r.peer, r.key,
+                                                  "self_destruct").c_str(), 0),
+                                              (uint32_t)storageGetInt(msgKey(s.slot, r.peer, r.key,
+                                                  "sd_note").c_str(), 0)),
                           &opaque)) {
                 storageSet(msgKey(s.slot, r.peer, r.key, "offered").c_str(), 1);
                 if (opaque)
@@ -729,6 +733,15 @@ static void handleSend(session_t& s, const LxmproxyFrame& fr)
     }
     if (!fr.method.empty())
         storageSet(msgKey(s.slot, peer, fr.key, "method").c_str(), fr.method.c_str());
+    /* The conversation's timer as the client has it, so what arrives here
+     * is judged against the same setting. */
+    if (fr.self_destruct)
+        storageSet(msgKey(s.slot, peer, fr.key, "self_destruct").c_str(), (int)fr.self_destruct);
+    if (fr.sd_note)
+        storageSet(msgKey(s.slot, peer, fr.key, "sd_note").c_str(), (int)fr.sd_note);
+    if (fr.self_destruct || fr.sd_note == LXMF_SD_NOTE_SET)
+        storageSet(("s.lxmf.id." + std::to_string(s.slot) + ".contacts." + peer +
+                    ".self_destruct").c_str(), (int)fr.self_destruct);
     char cmd[48], val[128];
     std::snprintf(cmd, sizeof cmd, "lxmf.id.%d.cmd.send", s.slot);
     if (fr.have_pn)
