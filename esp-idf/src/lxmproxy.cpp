@@ -173,17 +173,14 @@ static std::string msgKey(int slot, const std::string& peer,
     return b;
 }
 
-/* What a record replies to, as the wire carries it: the full 32-byte id, a
- * group's 3-byte one, or nothing (0). */
+/* What a record replies to, as the wire carries it: the 32-byte id, or nothing
+ * (0). */
 static size_t replyOf(int slot, const std::string& peer, const std::string& key,
                       uint8_t out[LXMPROXY_MID_LEN])
 {
     if (fromHex(storageGetStr(msgKey(slot, peer, key, "reply_to").c_str(), ""), out,
                 LXMPROXY_MID_LEN))
         return LXMPROXY_MID_LEN;
-    if (fromHex(storageGetStr(msgKey(slot, peer, key, "reply_short").c_str(), ""), out,
-                LXMPROXY_SHORT_ID_LEN))
-        return LXMPROXY_SHORT_ID_LEN;
     return 0;
 }
 
@@ -723,13 +720,9 @@ static void handleSend(session_t& s, const LxmproxyFrame& fr)
     storageSet(msgKey(s.slot, peer, fr.key, "body_size").c_str(), (int)fr.content.size());
     storageSet(msgKey(s.slot, peer, fr.key, "ts").c_str(),      (int)fr.ts);
     storageSet(msgKey(s.slot, peer, fr.key, "status").c_str(),  0 /* DRAFT */);
-    if (fr.have_reply_to || fr.have_reply_short) {
-        if (fr.have_reply_to)
-            storageSet(msgKey(s.slot, peer, fr.key, "reply_to").c_str(),
-                       toHex(fr.reply_to, LXMPROXY_MID_LEN).c_str());
-        else
-            storageSet(msgKey(s.slot, peer, fr.key, "reply_short").c_str(),
-                       toHex(fr.reply_short, LXMPROXY_SHORT_ID_LEN).c_str());
+    if (fr.have_reply_to) {
+        storageSet(msgKey(s.slot, peer, fr.key, "reply_to").c_str(),
+                   toHex(fr.reply_to, LXMPROXY_MID_LEN).c_str());
         if (!fr.reply_quote.empty())
             storageSet(msgKey(s.slot, peer, fr.key, "reply_quote").c_str(),
                        fr.reply_quote.c_str());

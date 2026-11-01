@@ -430,9 +430,11 @@ can be honoured.
 `MSG` carries a message's `FIELD_GROUP` (`group_from`, the 3-byte `orig_id`,
 `group_event`, `group_subjects`, and `group_data` — an `/info` or `/members`
 answer, which lxmf stores on a hosted account for exactly this) for an account
-that is a group member, and a reply reference of 32 bytes or a group's 3
-(`MSG`, `BODY`, `SEND` alike). So its owner's device
-sees who wrote what and acts on the group's notices.
+that is a group member. `group_from` crosses as the hosted account stored it:
+the 3 bytes the group named the writer by followed by zeros, since the hosted
+account keeps no member list to name them from, and the owner's device names
+the member. So its owner's device sees who wrote what and acts on the group's
+notices.
 
 **Deleting.** `ended=1` in a group's `CONFIG` hands lxmf `group_delete` and
 takes the group out of `s.lxmproxy.serves` at once; lxmf drops the slot itself
