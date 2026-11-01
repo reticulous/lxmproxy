@@ -86,6 +86,8 @@ lxmproxy pending           the clients that have identified but are not approved
 lxmproxy approve <hash>    host that account
 ```
 
+`<hash>` may contain spaces, and a full 64-hex hash is taken as its leading 32.
+
 A waiting client holds its Channel open, so approving is the last thing anybody
 has to do: this box re-offers immediately, the client hands the account over,
 and it starts answering on that address. The person asking presses **Use a

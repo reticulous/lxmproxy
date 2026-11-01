@@ -151,6 +151,25 @@ static bool fromHex(const std::string& s, uint8_t* out, size_t n)
     return true;
 }
 
+/* Hex a person typed or pasted may be grouped with spaces ("1303 a636 ...");
+ * operator-entered hashes go through this before they are checked. */
+static std::string stripSpaces(const std::string& s)
+{
+    std::string out;
+    for (char c : s) if (!std::isspace((unsigned char)c)) out += c;
+    return out;
+}
+
+/* An identity hash an operator entered: spaces stripped, and a full 64-hex hash
+ * cut to its leading 32 hex (the truncated hash Reticulum uses). */
+static std::string hexAddr(const std::string& s)
+{
+    std::string out = stripSpaces(s);
+    if (out.size() == 64 && out.find_first_not_of("0123456789abcdefABCDEF") == std::string::npos)
+        out.resize(32);
+    return out;
+}
+
 /* Monotonic since boot — deadlines and "how long ago", never a wire value. */
 static uint32_t nowS(void) { return (uint32_t)(esp_timer_get_time() / 1000000); }
 
@@ -1386,7 +1405,7 @@ static void acctSentinel(const char* key, const char* val)
              * an operator's to retype. `_id` names the item being committed
              * against, so it is where the id comes from on an edit. */
             if (!cJSON_IsString(idj)) idj = cJSON_GetObjectItem(o, "_id");
-            std::string id = cJSON_IsString(idj) ? idj->valuestring : "";
+            std::string id = cJSON_IsString(idj) ? hexAddr(idj->valuestring) : "";
             std::string lb = cJSON_IsString(lbj) ? lbj->valuestring : "";
             if (id.size() != RNSD_IDENT_HASH_LEN * 2)
                 err_msg = "An account identity is 32 hexadecimal characters.";
@@ -1470,8 +1489,7 @@ static void cliLxmproxy(const char* args)
         return;
     }
     if (a.rfind("approve ", 0) == 0) {
-        std::string id = a.substr(8);
-        while (!id.empty() && id.front() == ' ') id.erase(id.begin());
+        std::string id = hexAddr(a.substr(8));
         if (id.size() != RNSD_IDENT_HASH_LEN * 2) {
             cliPrintf("usage: lxmproxy approve <32-hex account identity>\n");
             return;
@@ -1483,8 +1501,7 @@ static void cliLxmproxy(const char* args)
         return;
     }
     if (a.rfind("revoke ", 0) == 0) {
-        std::string id = a.substr(7);
-        while (!id.empty() && id.front() == ' ') id.erase(id.begin());
+        std::string id = hexAddr(a.substr(7));
         storageSet("lxmproxy.acct.remove", id.c_str());
         cliPrintf("revoking %s\n", id.c_str());
         return;
